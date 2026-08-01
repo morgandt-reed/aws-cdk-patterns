@@ -2,14 +2,33 @@ import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecs_patterns from 'aws-cdk-lib/aws-ecs-patterns';
-import * as rds from 'aws-cdk-lib/aws-rds';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import { EcsConfig } from '../config/environments';
 
 export interface ComputeStackProps extends cdk.StackProps {
   vpc: ec2.IVpc;
-  database: rds.DatabaseCluster;
   config: EcsConfig;
+
+  /**
+   * Database connection details, passed as plain values rather than as the
+   * DatabaseStack's constructs.
+   *
+   * Handing the whole `rds.DatabaseCluster` across and calling
+   * `database.connections.allowFrom(service, ...)` reads naturally but is a
+   * dependency cycle: the ingress rule lands on the database's security group,
+   * which lives in DatabaseStack, and references this stack's service security
+   * group. DatabaseStack then depends on ComputeStack while ComputeStack
+   * already depends on DatabaseStack, and `cdk synth` fails with
+   * «DependencyCycle».
+   *
+   * Passing IDs keeps the dependency one-directional: this stack imports the
+   * database security group and creates the ingress rule on its own side.
+   */
+  databaseSecurityGroupId: string;
+  databaseEndpoint: string;
+  databasePort: number;
+  databaseSecretArn: string;
 }
 
 /**
@@ -25,9 +44,17 @@ export class ComputeStack extends cdk.Stack {
     // ECS Cluster
     this.cluster = new ecs.Cluster(this, 'Cluster', {
       vpc: props.vpc,
-      containerInsights: true,
+      containerInsightsV2: ecs.ContainerInsights.ENABLED,
       enableFargateCapacityProviders: true,
     });
+
+    // The credentials secret created by DatabaseStack. Imported by ARN so this
+    // stack does not need the DatabaseStack construct itself.
+    const dbSecret = secretsmanager.Secret.fromSecretCompleteArn(
+      this,
+      'DbSecret',
+      props.databaseSecretArn
+    );
 
     // Fargate Service with ALB
     this.service = new ecs_patterns.ApplicationLoadBalancedFargateService(
@@ -40,11 +67,14 @@ export class ComputeStack extends cdk.Stack {
           containerPort: 80,
           environment: {
             NODE_ENV: 'production',
+            DB_HOST: props.databaseEndpoint,
+            DB_PORT: String(props.databasePort),
           },
+          // Injected at task start from Secrets Manager, so the values never
+          // appear in the task definition or in CloudFormation.
           secrets: {
-            // Database credentials from Secrets Manager
-            // DB_HOST: ecs.Secret.fromSecretsManager(props.database.secret, 'host'),
-            // DB_PASSWORD: ecs.Secret.fromSecretsManager(props.database.secret, 'password'),
+            DB_USERNAME: ecs.Secret.fromSecretsManager(dbSecret, 'username'),
+            DB_PASSWORD: ecs.Secret.fromSecretsManager(dbSecret, 'password'),
           },
         },
         cpu: props.config.cpu,
@@ -86,10 +116,21 @@ export class ComputeStack extends cdk.Stack {
       scaleOutCooldown: cdk.Duration.seconds(60),
     });
 
-    // Allow ECS to access database
-    props.database.connections.allowFrom(
-      this.service.service,
-      ec2.Port.tcp(5432),
+    // Allow ECS to reach the database.
+    //
+    // The security group is imported as mutable, so the ingress rule is
+    // rendered into *this* stack rather than into DatabaseStack. That is what
+    // keeps the dependency one-directional — see ComputeStackProps.
+    const databaseSecurityGroup = ec2.SecurityGroup.fromSecurityGroupId(
+      this,
+      'DbSecurityGroup',
+      props.databaseSecurityGroupId,
+      { mutable: true }
+    );
+
+    this.service.service.connections.allowTo(
+      databaseSecurityGroup,
+      ec2.Port.tcp(props.databasePort),
       'Allow ECS to access Aurora'
     );
 

@@ -5,142 +5,112 @@
 [![AWS CDK](https://img.shields.io/badge/AWS_CDK-2.120-orange?logo=amazonaws)](https://aws.amazon.com/cdk/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue?logo=typescript)](https://www.typescriptlang.org/)
 
-Production-ready AWS CDK patterns demonstrating infrastructure as code with TypeScript for common cloud architectures.
+Four CDK stacks in TypeScript — network, database, compute and serverless —
+wired together as one app with per-environment configuration.
 
-## Architecture Patterns
+`npm ci && npm run build && npm run lint && npm test -- --coverage && npx cdk synth --all`
+is what CI runs, and it passes. Coverage is enforced by a threshold in
+`jest.config.js`; nothing in the workflow is marked `continue-on-error`.
 
-### Three-Tier Web Application
+Not included: no CloudFront, WAF, ACM certificate, Cognito, SQS, SNS, Kinesis,
+Step Functions or ElastiCache. The stacks below are the whole repository.
+
+## Architecture
+
+### What the four stacks actually build
 
 ```mermaid
 flowchart TB
-    subgraph Internet
-        Users((Users))
-    end
+    Users((Users))
 
     subgraph AWS Cloud
-        subgraph Edge
-            CF[CloudFront<br/>CDN]
-            WAF[WAF<br/>Web Firewall]
-        end
-
-        subgraph VPC[VPC 10.0.0.0/16]
-            subgraph Public Subnets
-                ALB[Application<br/>Load Balancer]
-            end
-
-            subgraph Private Subnets
-                subgraph ECS[ECS Fargate Cluster]
-                    Task1[Task]
-                    Task2[Task]
-                    Task3[Task]
-                end
-            end
-
-            subgraph Data Subnets
-                RDS[(RDS Aurora<br/>PostgreSQL)]
-                Cache[(ElastiCache<br/>Redis)]
+        subgraph NetworkStack
+            subgraph VPC[VPC 10.0.0.0/16]
+                Public[Public Subnets]
+                Private[Private Subnets<br/>with egress]
+                Isolated[Isolated Subnets<br/>no route out]
             end
         end
 
-        subgraph Storage
-            S3[(S3 Bucket<br/>Static Assets)]
+        subgraph ComputeStack
+            ALB[Application<br/>Load Balancer]
+            ECS[ECS Fargate Service<br/>FARGATE_SPOT weighted]
+        end
+
+        subgraph DatabaseStack
+            RDS[(Aurora PostgreSQL<br/>Serverless v2)]
+            Secret[Secrets Manager<br/>generated credentials]
+        end
+
+        subgraph ServerlessStack
+            APIGW[API Gateway<br/>REST]
+            Lambda[Lambda handler<br/>stub]
+            DDB[(DynamoDB)]
         end
     end
 
-    Users --> CF
-    CF --> WAF
-    WAF --> ALB
-    CF --> S3
+    Users -->|HTTP| ALB
     ALB --> ECS
-    ECS --> RDS
-    ECS --> Cache
+    ECS -->|:5432| RDS
+    ECS -->|reads at task start| Secret
+    Users -->|HTTPS| APIGW
+    APIGW --> Lambda
+    Lambda --> DDB
 
-    style CF fill:#8B5CF6,color:#fff
+    ALB -.-> Public
+    ECS -.-> Private
+    RDS -.-> Isolated
+
     style ALB fill:#FF9900,color:#000
     style ECS fill:#FF9900,color:#000
     style RDS fill:#3B48CC,color:#fff
+    style APIGW fill:#8B5CF6,color:#fff
+    style Lambda fill:#FF9900,color:#000
 ```
 
-### Serverless API Pattern
+The ALB listens on **HTTP only**. Adding HTTPS needs an ACM certificate and a
+domain, neither of which this repository has; wire up `certificate` and
+`redirectHTTP` on the Fargate pattern before putting it in front of anything real.
+
+### Stack dependencies
 
 ```mermaid
 flowchart LR
-    subgraph Client
-        App[Mobile/Web App]
-    end
-
-    subgraph AWS
-        APIGW[API Gateway<br/>REST API]
-        Lambda[Lambda<br/>Functions]
-        DDB[(DynamoDB)]
-        Cognito[Cognito<br/>User Pool]
-        SQS[SQS Queue]
-        SNS[SNS Topic]
-    end
-
-    App -->|HTTPS| APIGW
-    APIGW -->|Authorize| Cognito
-    APIGW --> Lambda
-    Lambda --> DDB
-    Lambda --> SQS
-    SQS --> Lambda
-    Lambda --> SNS
-
-    style APIGW fill:#8B5CF6,color:#fff
-    style Lambda fill:#FF9900,color:#000
-    style DDB fill:#3B48CC,color:#fff
+    Network[NetworkStack] --> Database[DatabaseStack]
+    Network --> Serverless[ServerlessStack]
+    Database --> Compute[ComputeStack]
+    Network --> Compute
 ```
 
-### Event-Driven Processing
-
-```mermaid
-flowchart TB
-    subgraph Ingestion
-        S3In[(S3 Bucket<br/>Raw Data)]
-        Kinesis[Kinesis<br/>Data Stream]
-    end
-
-    subgraph Processing
-        Lambda1[Lambda<br/>Transform]
-        StepFn[Step Functions<br/>Orchestrator]
-        Glue[Glue<br/>ETL Job]
-    end
-
-    subgraph Storage
-        S3Out[(S3 Bucket<br/>Processed)]
-        Athena[Athena<br/>Query]
-        Redshift[(Redshift<br/>Warehouse)]
-    end
-
-    S3In -->|Event| Lambda1
-    Kinesis --> Lambda1
-    Lambda1 --> StepFn
-    StepFn --> Glue
-    Glue --> S3Out
-    S3Out --> Athena
-    Glue --> Redshift
-
-    style StepFn fill:#CD2264,color:#fff
-    style Lambda1 fill:#FF9900,color:#000
-    style Redshift fill:#3B48CC,color:#fff
-```
+Dependencies run one way only, which is not free: ComputeStack takes the
+database's security group ID, endpoint and secret ARN as **plain values**, not
+as the `DatabaseCluster` construct. Passing the construct and calling
+`database.connections.allowFrom(service, ...)` reads better but puts the ingress
+rule in DatabaseStack while referencing ComputeStack's security group, and
+`cdk synth` fails with «DependencyCycle». `test/app.test.ts` synthesizes all
+three environments to keep that from coming back.
 
 ## Features
 
-- **Type-Safe Infrastructure**: TypeScript with full IDE support
-- **Reusable Constructs**: Modular, composable patterns
-- **Best Practices**: Security, cost optimization, high availability
-- **Multi-Environment**: Dev, staging, production configurations
-- **CI/CD Ready**: GitHub Actions for deployment pipelines
-- **Well-Documented**: Inline comments and architecture docs
+- **Typed environment config** — `lib/config/environments.ts` defines dev,
+  staging and prod; every stack takes its slice as a typed prop, so a missing
+  field is a compile error rather than a deploy-time surprise
+- **Environment-derived safety settings** — Aurora `deletionProtection` and
+  `RemovalPolicy` follow `backupRetention`, and the DynamoDB table's removal
+  policy follows a `retainData` flag, so prod data is retained and dev is not
+- **Aurora Serverless v2 in isolated subnets** with credentials generated into
+  Secrets Manager and injected into the Fargate task at start
+- **Weighted FARGATE_SPOT** with a deployment circuit breaker that rolls back
+- **36 `Template` assertion tests** across all four stacks and the VPC construct,
+  with 100% coverage and a 90% floor enforced in CI
 
 ## Tech Stack
 
-- **CDK Version**: 2.120+
+- **CDK**: aws-cdk-lib 2.120+
 - **Language**: TypeScript 5.3
 - **Node.js**: 20.x LTS
-- **Testing**: Jest + CDK assertions
-- **Linting**: ESLint + Prettier
+- **Testing**: Jest + `aws-cdk-lib/assertions`
+- **Linting**: ESLint 9 flat config with typescript-eslint. No Prettier.
 
 ## Project Structure
 
@@ -152,22 +122,25 @@ flowchart TB
 ├── tsconfig.json
 ├── bin/
 │   └── app.ts                    # CDK app entry point
+├── eslint.config.js
+├── jest.config.js
+├── bin/
+│   └── app.ts                    # CDK app entry point
 ├── lib/
-│   ├── constructs/               # Reusable L3 constructs
-│   │   ├── vpc-construct.ts
-│   │   ├── ecs-service.ts
-│   │   ├── rds-database.ts
-│   │   └── lambda-api.ts
-│   ├── stacks/                   # Application stacks
+│   ├── constructs/
+│   │   └── vpc-construct.ts      # The only L3 construct
+│   ├── stacks/
 │   │   ├── network-stack.ts
 │   │   ├── database-stack.ts
 │   │   ├── compute-stack.ts
 │   │   └── serverless-stack.ts
 │   └── config/
-│       └── environments.ts       # Environment configurations
+│       └── environments.ts       # Typed per-environment configuration
 ├── test/
+│   ├── app.test.ts               # Whole-app synth, dependency-cycle regression
 │   ├── constructs/
-│   └── stacks/
+│   │   └── vpc-construct.test.ts
+│   └── stacks/                   # One suite per stack
 └── .github/
     └── workflows/
         └── ci.yml
@@ -222,314 +195,239 @@ cdk deploy     # Deploy stacks
 cdk destroy    # Tear down
 ```
 
-## Patterns Included
+## What each stack contains
 
-### 1. VPC with Best Practices
+### NetworkStack — `VpcConstruct`
 
-Multi-AZ VPC with public, private, and isolated subnets.
+The one reusable L3 construct in the repo. Three subnet tiers, NAT gateway count
+configurable down to zero, flow logs optional, S3 and DynamoDB gateway endpoints
+(both free).
 
 ```typescript
-import { VpcConstruct } from './constructs/vpc-construct';
-
 const vpc = new VpcConstruct(this, 'Vpc', {
   maxAzs: 3,
-  natGateways: 1,  // Cost optimization for non-prod
+  natGateways: 1,      // 0 in dev is the single biggest cost lever
   enableFlowLogs: true,
 });
 ```
 
-**Features:**
-- 3 subnet tiers (public, private, isolated)
-- NAT Gateway with cost optimization options
-- VPC Flow Logs to CloudWatch
-- VPC Endpoints for AWS services
+Public subnets set `mapPublicIpOnLaunch: false`; anything that needs a public IP
+has to ask for one. Interface endpoints (ECR, Secrets Manager) are present as
+commented-out examples because each one costs money per AZ.
 
-### 2. ECS Fargate Service
-
-Containerized application on ECS Fargate with auto-scaling.
+### DatabaseStack — Aurora PostgreSQL Serverless v2
 
 ```typescript
-import { EcsService } from './constructs/ecs-service';
-
-const service = new EcsService(this, 'Api', {
-  vpc,
-  image: 'my-app:latest',
-  cpu: 256,
-  memory: 512,
-  desiredCount: 2,
-  scaling: {
-    minCapacity: 2,
-    maxCapacity: 10,
-    targetCpuUtilization: 70,
-  },
+new DatabaseStack(app, 'DatabaseStack', {
+  vpc: networkStack.vpc,
+  config: { serverless: true, minCapacity: 0.5, maxCapacity: 4,
+            multiAz: false, backupRetention: 7 },
 });
 ```
 
-**Features:**
-- Fargate Spot for cost savings
-- Auto-scaling based on CPU/memory
-- Application Load Balancer integration
-- Secrets Manager integration
-- CloudWatch Container Insights
+- Placed in `PRIVATE_ISOLATED` subnets, which have no route to a NAT gateway
+- Credentials generated into Secrets Manager, never a variable or a parameter
+- `multiAz` adds a serverless v2 reader that scales with the writer
+- `deletionProtection` and `RemovalPolicy.RETAIN` are switched on when
+  `backupRetention > 7`, which is how prod is distinguished from dev
+- Security group has `allowAllOutbound: false`
 
-### 3. Aurora Serverless Database
+Not included: Performance Insights, secret rotation, and the RDS Data API.
 
-Serverless PostgreSQL with automatic scaling.
+### ComputeStack — ECS Fargate behind an ALB
 
 ```typescript
-import { RdsDatabase } from './constructs/rds-database';
-
-const database = new RdsDatabase(this, 'Database', {
-  vpc,
-  engine: 'postgresql',
-  serverless: true,
-  scaling: {
-    minCapacity: 0.5,  // ACUs
-    maxCapacity: 16,
-  },
-  enableDataApi: true,
+new ComputeStack(app, 'ComputeStack', {
+  vpc: networkStack.vpc,
+  config: { desiredCount: 1, cpu: 256, memory: 512,
+            minCapacity: 1, maxCapacity: 4, useFargateSpot: true },
+  databaseSecurityGroupId: databaseStack.securityGroup.securityGroupId,
+  databaseEndpoint: databaseStack.database.clusterEndpoint.hostname,
+  databasePort: DatabaseStack.PORT,
+  databaseSecretArn: databaseStack.secret.secretArn,
 });
 ```
 
-**Features:**
-- Aurora Serverless v2
-- Automatic backups with PITR
-- Multi-AZ deployment
-- Secrets rotation
-- Performance Insights
+- 80/20 FARGATE_SPOT / FARGATE split when `useFargateSpot` is set
+- Deployment circuit breaker with rollback
+- Target-tracking autoscaling on both CPU and memory
+- `DB_USERNAME` and `DB_PASSWORD` injected from Secrets Manager at task start,
+  so they never appear in the task definition or the CloudFormation template
+- Container Insights enabled
 
-### 4. Lambda API with API Gateway
+The container image is `amazon/amazon-ecs-sample`. Swap it for your own.
 
-Serverless REST API with Lambda handlers.
+### ServerlessStack — API Gateway + Lambda + DynamoDB
 
 ```typescript
-import { LambdaApi } from './constructs/lambda-api';
-
-const api = new LambdaApi(this, 'Api', {
-  routes: [
-    { path: '/users', method: 'GET', handler: 'handlers/users.list' },
-    { path: '/users', method: 'POST', handler: 'handlers/users.create' },
-    { path: '/users/{id}', method: 'GET', handler: 'handlers/users.get' },
-  ],
-  authorization: 'cognito',
-  cors: true,
+new ServerlessStack(app, 'ServerlessStack', {
+  vpc: networkStack.vpc,
+  config: { memorySize: 256, timeout: 30, retainData: false },
 });
 ```
 
-**Features:**
-- REST API with OpenAPI spec
-- Cognito or API Key authorization
-- Request validation
-- Lambda Powertools integration
-- X-Ray tracing
+- REST API with five routes on `/items` and `/items/{id}`, CORS preflight,
+  X-Ray tracing and access logging
+- Pay-per-request DynamoDB table with point-in-time recovery; removal policy
+  follows `retainData`
+- Lambda with X-Ray tracing and a one-week log group
 
-### 5. Static Website with CloudFront
-
-S3-hosted website with CloudFront CDN.
-
-```typescript
-import { StaticSite } from './constructs/static-site';
-
-const site = new StaticSite(this, 'Website', {
-  domainName: 'example.com',
-  certificate: certificate,
-  enableWaf: true,
-  spaMode: true,  // Single Page Application
-});
-```
-
-**Features:**
-- S3 origin with OAC
-- CloudFront distribution
-- Custom domain with ACM certificate
-- WAF protection
-- Cache invalidation on deploy
+**The Lambda handler is a stub.** It echoes the request and never reads or
+writes the DynamoDB table it is granted access to. Replace `Code.fromInline`
+with a `NodejsFunction` bundling a real handler before this is useful. There is
+no Cognito authorizer, no request validation and no SQS/SNS integration.
 
 ## Environment Configuration
 
-```typescript
-// lib/config/environments.ts
-export const environments = {
-  dev: {
-    account: '111111111111',
-    region: 'us-west-2',
-    vpc: {
-      maxAzs: 2,
-      natGateways: 1,
-    },
-    ecs: {
-      desiredCount: 1,
-      cpu: 256,
-      memory: 512,
-    },
-  },
-  prod: {
-    account: '222222222222',
-    region: 'us-east-1',
-    vpc: {
-      maxAzs: 3,
-      natGateways: 3,
-    },
-    ecs: {
-      desiredCount: 3,
-      cpu: 1024,
-      memory: 2048,
-    },
-  },
-};
-```
-
-## Security Best Practices
-
-### IAM Least Privilege
+`lib/config/environments.ts` is a `Record<string, EnvironmentConfig>` with `dev`,
+`staging` and `prod`. Pick one with `--context env=<name>`; an unknown name
+throws at synth time rather than deploying something unintended.
 
 ```typescript
-// Grant specific permissions
-bucket.grantRead(lambdaFunction);
-table.grantReadWriteData(ecsTask.taskRole);
-
-// Use managed policies sparingly
-taskRole.addManagedPolicy(
-  ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore')
-);
+export interface EnvironmentConfig {
+  account?: string;          // falls back to CDK_DEFAULT_ACCOUNT
+  region: string;
+  vpc: VpcConfig;            // maxAzs, natGateways, enableFlowLogs
+  ecs: EcsConfig;            // cpu, memory, desiredCount, scaling, useFargateSpot
+  database: DatabaseConfig;  // serverless capacity, multiAz, backupRetention
+  serverless: ServerlessConfig; // memorySize, timeout, reservedConcurrency, retainData
+}
 ```
 
-### Secrets Management
+The differences that matter between dev and prod:
 
-```typescript
-// Store in Secrets Manager
-const secret = new Secret(this, 'DbSecret', {
-  generateSecretString: {
-    secretStringTemplate: JSON.stringify({ username: 'admin' }),
-    generateStringKey: 'password',
-    excludePunctuation: true,
-  },
-});
+| | dev | prod |
+|---|---|---|
+| NAT gateways | 1 | 3 |
+| VPC flow logs | off | on |
+| Fargate Spot | on (80/20) | off |
+| Aurora reader | none | one, scaling with the writer |
+| Aurora backup retention | 7 days | 35 days |
+| Aurora deletion protection | off | on |
+| DynamoDB removal policy | DESTROY | RETAIN |
 
-// Pass to container
-container.addSecret('DB_PASSWORD', ecs.Secret.fromSecretsManager(secret));
-```
+`account` is left unset in all three, so `CDK_DEFAULT_ACCOUNT` decides. Set it
+explicitly before you have more than one account.
 
-### Network Security
+## Security Notes
 
-```typescript
-// Security groups with least privilege
-dbSecurityGroup.addIngressRule(
-  appSecurityGroup,
-  ec2.Port.tcp(5432),
-  'Allow app tier'
-);
+What this repository does, with the file it does it in:
 
-// VPC endpoints for private access
-vpc.addInterfaceEndpoint('SecretsEndpoint', {
-  service: ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
-});
-```
+- **Generated credentials.** `database-stack.ts` creates a Secrets Manager
+  secret with a 32-character generated password. No password appears in code,
+  in a context value, or in the CloudFormation template.
+- **Injected, not embedded.** `compute-stack.ts` passes `DB_USERNAME` and
+  `DB_PASSWORD` through `ecs.Secret.fromSecretsManager`, so the task definition
+  holds an ARN and the value is resolved at task start. A test asserts this.
+- **Isolated database subnets.** The Aurora cluster sits in
+  `PRIVATE_ISOLATED` subnets with no route to a NAT gateway.
+- **Scoped security groups.** The database SG uses `allowAllOutbound: false`,
+  and the only ingress is 5432 from the Fargate service SG.
+- **Scoped IAM.** `table.grantReadWriteData(handler)` rather than a managed
+  policy; no `AdministratorAccess` anywhere.
 
-## Cost Optimization
+What it does **not** do, and would need before production:
 
-### Fargate Spot
+- **The ALB is HTTP-only.** No ACM certificate, no HTTPS listener, no redirect.
+- **No secret rotation.** The Aurora secret is generated once and never rotated.
+- **No WAF, no Cognito authorizer.** The API Gateway routes are unauthenticated.
+- **No interface VPC endpoints.** Secrets Manager and ECR are reached over the
+  NAT gateway; the endpoints are present as commented-out examples because each
+  costs money per AZ.
 
-```typescript
-const service = new ecs.FargateService(this, 'Service', {
-  capacityProviderStrategies: [
-    { capacityProvider: 'FARGATE_SPOT', weight: 80 },
-    { capacityProvider: 'FARGATE', weight: 20 },
-  ],
-});
-```
+## Cost Notes
 
-### NAT Gateway Alternatives
+The levers that actually matter here, in the order they matter:
 
-```typescript
-// Single NAT for dev
-const vpc = new ec2.Vpc(this, 'Vpc', {
-  natGateways: props.environment === 'prod' ? 3 : 1,
-});
+- **NAT gateways.** Roughly $32/month each plus data processing, and prod
+  creates three. `natGateways: 0` in a dev VPC removes the largest line item;
+  `ec2.NatProvider.instance()` with a t4g.micro is the cheaper middle ground.
+- **Fargate Spot.** dev and staging run an 80/20 FARGATE_SPOT/FARGATE split.
+  prod is on-demand only, because Spot interruptions during a deployment
+  interact badly with the circuit breaker.
+- **Aurora Serverless v2.** dev floors at 0.5 ACU. Serverless v2 supports a
+  minimum of 0 ACU (true scale-to-zero) on recent engine versions, which this
+  repository does not currently use.
+- **DynamoDB on-demand.** Pay-per-request avoids provisioning for a table with
+  no traffic; switch to provisioned once the load is predictable.
 
-// Or use NAT instances
-const natProvider = ec2.NatProvider.instance({
-  instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
-});
-```
-
-### Auto-Scaling to Zero
-
-```typescript
-// Aurora Serverless
-const cluster = new rds.DatabaseCluster(this, 'Db', {
-  serverlessV2MinCapacity: 0,  // Scale to zero
-  serverlessV2MaxCapacity: 16,
-});
-```
+Run `npx cdk synth --all --context env=prod` and price the output rather than
+trusting these numbers.
 
 ## Testing
 
-### Unit Tests
+36 tests across 6 suites, all using `Template` assertions from
+`aws-cdk-lib/assertions`. There are no snapshot tests — they lock in the current
+output rather than asserting a property, and they go stale on every CDK upgrade.
 
-```typescript
-import { Template } from 'aws-cdk-lib/assertions';
-import { VpcConstruct } from '../lib/constructs/vpc-construct';
-
-test('VPC has correct number of AZs', () => {
-  const app = new cdk.App();
-  const stack = new cdk.Stack(app, 'TestStack');
-
-  new VpcConstruct(stack, 'Vpc', { maxAzs: 3 });
-
-  const template = Template.fromStack(stack);
-  template.resourceCountIs('AWS::EC2::Subnet', 9);  // 3 AZs * 3 tiers
-});
+```bash
+npm test               # 36 tests
+npm test -- --coverage # the form CI runs, which enforces the threshold
 ```
 
-### Snapshot Tests
+Coverage is currently 100% on statements, branches, functions and lines. The
+threshold in `jest.config.js` is set at 90 so an incidental refactor does not
+turn CI red, while adding an untested stack still does. `roots` includes `lib/`
+so that a file no test imports shows up as 0% rather than being omitted from the
+report entirely.
+
+What the tests actually assert, beyond resource counts:
+
+- `test/app.test.ts` synthesizes all three environments end to end. This is the
+  regression test for the DependencyCycle described above — every per-stack
+  suite passed while `cdk synth` was failing.
+- `compute-stack.test.ts` asserts the database ingress rule is rendered in
+  ComputeStack, and that no literal password reaches the task definition.
+- `database-stack.test.ts` asserts deletion protection and `DeletionPolicy`
+  flip with `backupRetention`, and that dev gets one instance while multiAz
+  gets two.
+- `serverless-stack.test.ts` asserts the DynamoDB `DeletionPolicy` flips with
+  `retainData`.
 
 ```typescript
-test('Stack matches snapshot', () => {
-  const app = new cdk.App();
-  const stack = new NetworkStack(app, 'Network');
-
-  expect(Template.fromStack(stack).toJSON()).toMatchSnapshot();
+test('the database ingress rule is created in this stack, not the database stack', () => {
+  synth(spotConfig).hasResourceProperties('AWS::EC2::SecurityGroupIngress', {
+    GroupId: 'sg-0123456789abcdef0',
+    FromPort: 5432,
+    ToPort: 5432,
+    IpProtocol: 'tcp',
+  });
 });
 ```
 
 ## CI/CD Pipeline
 
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). Two jobs, no
+`continue-on-error` and no `|| true` anywhere:
+
+| Job | Steps |
+|---|---|
+| `build` | `npm ci`, `npm run build`, `npm run lint`, `npm test -- --coverage`, then `cdk synth --all` for dev, staging **and** prod |
+| `security` | `cdk synth --all --context env=prod`, then cfn-nag over `cdk.out` |
+
+Synthesizing every environment is the point: a cross-stack dependency cycle only
+shows up when the whole app is synthesized, and it is invisible to per-stack
+tests.
+
+There is deliberately **no** `cdk diff` job and no deploy job. Both need an OIDC
+role with access to a real account, which this repository does not have
+configured. A job that checks out, builds and posts nothing would report a green
+"CDK Diff" check having diffed nothing. Add them together with the role:
+
 ```yaml
-# .github/workflows/ci.yml
-name: CDK Pipeline
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - run: npm ci
-      - run: npm run build
-      - run: npm test
-      - run: npx cdk synth
-
   deploy:
     if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-west-2
-
       - run: npm ci
       - run: npx cdk deploy --all --require-approval never
 ```
@@ -559,6 +457,16 @@ jobs:
 - Simple infrastructure
 - Team prefers declarative syntax
 
+## Next Steps
+
+- [ ] HTTPS on the ALB: ACM certificate, HTTPS listener, HTTP redirect
+- [ ] Replace the Lambda stub with a `NodejsFunction` that reads and writes the
+      DynamoDB table it is already granted
+- [ ] A policy-as-code CDK Aspect that fails synth on unencrypted storage or
+      wide-open security groups
+- [ ] Secret rotation on the Aurora credentials
+- [ ] OIDC role, then a real `cdk diff` job on PRs
+
 ## Resources
 
 - [AWS CDK Documentation](https://docs.aws.amazon.com/cdk/latest/guide/)
@@ -569,7 +477,3 @@ jobs:
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details
-
----
-
-**Built to demonstrate production-ready AWS CDK patterns for cloud-native applications.**

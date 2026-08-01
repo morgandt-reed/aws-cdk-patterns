@@ -27,21 +27,28 @@ export class ServerlessStack extends cdk.Stack {
       partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      pointInTimeRecovery: true,
-
-      // Global Secondary Index for queries
-      // Uncomment if needed:
-      // globalSecondaryIndexes: [{
-      //   indexName: 'GSI1',
-      //   partitionKey: { name: 'gsi1pk', type: dynamodb.AttributeType.STRING },
-      //   sortKey: { name: 'gsi1sk', type: dynamodb.AttributeType.STRING },
-      // }],
+      // Environment-derived, like DatabaseStack. An unconditional DESTROY drops
+      // the production table with the stack.
+      removalPolicy: props.config.retainData
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
     });
 
-    // Lambda function
+    const handlerLogGroup = new logs.LogGroup(this, 'HandlerLogs', {
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Lambda function.
+    //
+    // This is a stub: it echoes the request and does not touch the DynamoDB
+    // table it is granted access to. Replace the inline code with a
+    // NodejsFunction bundling a real handler before using this for anything.
     const handler = new lambda.Function(this, 'Handler', {
-      runtime: lambda.Runtime.NODEJS_20_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'index.handler',
       code: lambda.Code.fromInline(`
         exports.handler = async (event) => {
@@ -64,7 +71,7 @@ export class ServerlessStack extends cdk.Stack {
         NODE_OPTIONS: '--enable-source-maps',
       },
       tracing: lambda.Tracing.ACTIVE,
-      logRetention: logs.RetentionDays.ONE_WEEK,
+      logGroup: handlerLogGroup,
       reservedConcurrentExecutions: props.config.reservedConcurrency,
     });
 

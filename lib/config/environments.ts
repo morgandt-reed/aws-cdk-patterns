@@ -30,6 +30,12 @@ export interface ServerlessConfig {
   memorySize: number;
   timeout: number;
   reservedConcurrency?: number;
+
+  /**
+   * Retain the DynamoDB table when the stack is deleted. True for any
+   * environment holding data you cannot recreate.
+   */
+  retainData: boolean;
 }
 
 export interface EnvironmentConfig {
@@ -67,6 +73,7 @@ export const environments: Record<string, EnvironmentConfig> = {
     serverless: {
       memorySize: 256,
       timeout: 30,
+      retainData: false,
     },
   },
 
@@ -95,6 +102,7 @@ export const environments: Record<string, EnvironmentConfig> = {
     serverless: {
       memorySize: 512,
       timeout: 30,
+      retainData: false,
     },
   },
 
@@ -124,6 +132,7 @@ export const environments: Record<string, EnvironmentConfig> = {
       memorySize: 1024,
       timeout: 30,
       reservedConcurrency: 100,
+      retainData: true,
     },
   },
 };

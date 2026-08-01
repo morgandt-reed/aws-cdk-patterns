@@ -14,6 +14,9 @@ export interface DatabaseStackProps extends cdk.StackProps {
  * Database Stack - Aurora PostgreSQL Serverless v2
  */
 export class DatabaseStack extends cdk.Stack {
+  /** Port Aurora PostgreSQL listens on. */
+  public static readonly PORT = 5432;
+
   public readonly database: rds.DatabaseCluster;
   public readonly secret: secretsmanager.ISecret;
   public readonly securityGroup: ec2.SecurityGroup;
@@ -91,6 +94,12 @@ export class DatabaseStack extends cdk.Stack {
       value: this.secret.secretArn,
       description: 'Database credentials secret ARN',
       exportName: `${id}-SecretArn`,
+    });
+
+    new cdk.CfnOutput(this, 'SecurityGroupId', {
+      value: this.securityGroup.securityGroupId,
+      description: 'Database security group ID',
+      exportName: `${id}-SecurityGroupId`,
     });
   }
 }

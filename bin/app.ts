@@ -43,12 +43,18 @@ const databaseStack = new DatabaseStack(app, `${envName}-DatabaseStack`, {
   },
 });
 
-// Compute Stack
-const computeStack = new ComputeStack(app, `${envName}-ComputeStack`, {
+// Compute Stack.
+// Database connection details are passed as plain values; handing over the
+// DatabaseCluster construct and calling connections.allowFrom() across stacks
+// produces a dependency cycle. See ComputeStackProps.
+new ComputeStack(app, `${envName}-ComputeStack`, {
   env,
   vpc: networkStack.vpc,
-  database: databaseStack.database,
   config: envConfig.ecs,
+  databaseSecurityGroupId: databaseStack.securityGroup.securityGroupId,
+  databaseEndpoint: databaseStack.database.clusterEndpoint.hostname,
+  databasePort: DatabaseStack.PORT,
+  databaseSecretArn: databaseStack.secret.secretArn,
   tags: {
     Environment: envName,
     Project: 'aws-cdk-patterns',
@@ -56,7 +62,7 @@ const computeStack = new ComputeStack(app, `${envName}-ComputeStack`, {
 });
 
 // Serverless Stack
-const serverlessStack = new ServerlessStack(app, `${envName}-ServerlessStack`, {
+new ServerlessStack(app, `${envName}-ServerlessStack`, {
   env,
   vpc: networkStack.vpc,
   config: envConfig.serverless,
@@ -66,7 +72,5 @@ const serverlessStack = new ServerlessStack(app, `${envName}-ServerlessStack`, {
   },
 });
 
-// Add dependencies
-databaseStack.addDependency(networkStack);
-computeStack.addDependency(databaseStack);
-serverlessStack.addDependency(networkStack);
+// No explicit addDependency() calls: every cross-stack reference above creates
+// the dependency implicitly, and the explicit ones previously masked the cycle.
